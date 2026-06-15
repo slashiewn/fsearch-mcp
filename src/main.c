@@ -26,6 +26,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <stdarg.h>
+#include <pthread.h>
 
 /* ──────────────────────── JSON helpers ──────────────────────── */
 
@@ -123,15 +124,77 @@ static void handle_list_tools(unsigned id) {
 static FsearchDatabaseIndexStore *g_store = NULL;
 static char *g_db_path = NULL;
 static char *g_index_dir = NULL;
+static pthread_mutex_t g_store_lock = PTHREAD_MUTEX_INITIALIZER;
+static volatile int g_scanning = 0;
+
+/* Background scan thread */
+typedef struct {
+    char *path;
+} ScanArg;
+
+static void* scan_thread(void *arg) {
+    ScanArg *sa = (ScanArg*)arg;
+
+    /* Create include manager */
+    FsearchDatabaseIncludeManager *im = fsearch_database_include_manager_new();
+    FsearchDatabaseInclude *inc = fsearch_database_include_new(sa->path, TRUE, FALSE, TRUE, TRUE, 0, 0);
+    if (inc) {
+        fsearch_database_include_manager_add(im, inc);
+        fsearch_database_include_unref(inc);
+    }
+
+    FsearchDatabaseExcludeManager *em = fsearch_database_exclude_manager_new();
+    FsearchDatabaseIndexPropertyFlags flags =
+        DATABASE_INDEX_PROPERTY_NAME |
+        DATABASE_INDEX_PROPERTY_PATH |
+        DATABASE_INDEX_PROPERTY_MODIFICATION_TIME;
+
+    FsearchDatabaseIndexStore *store = fsearch_database_index_store_new(im, em, flags, NULL, NULL);
+    if (store) {
+        fsearch_database_index_store_start(store, NULL);
+
+        pthread_mutex_lock(&g_store_lock);
+        if (g_store) fsearch_database_index_store_unref(g_store);
+        g_store = store;
+        g_scanning = 0;
+        pthread_mutex_unlock(&g_store_lock);
+    } else {
+        pthread_mutex_lock(&g_store_lock);
+        g_scanning = 0;
+        pthread_mutex_unlock(&g_store_lock);
+    }
+
+    free(sa->path);
+    free(sa);
+    return NULL;
+}
 
 /* ────────────── search ────────────── */
 
+static FsearchDatabaseIndexStore* get_store(void) {
+    pthread_mutex_lock(&g_store_lock);
+    FsearchDatabaseIndexStore *s = g_store;
+    if (s) fsearch_database_index_store_ref(s);
+    pthread_mutex_unlock(&g_store_lock);
+    return s;
+}
+
+static void set_store(FsearchDatabaseIndexStore *s) {
+    pthread_mutex_lock(&g_store_lock);
+    if (g_store) fsearch_database_index_store_unref(g_store);
+    g_store = s;
+    if (s) fsearch_database_index_store_ref(s);
+    pthread_mutex_unlock(&g_store_lock);
+}
+
 static void handle_search(unsigned id, const char *query_str, int limit) {
-    if (!g_store) {
+    FsearchDatabaseIndexStore *store = get_store();
+    if (!store) {
         send_error(id, -32000, "Database not initialized. Call scan or load first.");
         return;
     }
     if (!query_str || !*query_str) {
+        fsearch_database_index_store_unref(store);
         send_error(id, -32002, "Empty query");
         return;
     }
@@ -140,6 +203,7 @@ static void handle_search(unsigned id, const char *query_str, int limit) {
     /* Build query object (filter/filters/query_id all NULL/0) */
     FsearchQuery *query = fsearch_query_new(query_str, NULL, NULL, (FsearchQueryFlags)0, NULL);
     if (!query) {
+        fsearch_database_index_store_unref(store);
         send_error(id, -32003, "Failed to parse query");
         return;
     }
@@ -147,7 +211,7 @@ static void handle_search(unsigned id, const char *query_str, int limit) {
     /* Execute search — view_id = 0 */
     uint32_t view_id = 0;
     gboolean ok = fsearch_database_index_store_search(
-        g_store, view_id, query,
+        store, view_id, query,
         DATABASE_INDEX_PROPERTY_PATH,
         FSEARCH_SORT_ASCENDING,
         NULL);
@@ -159,9 +223,10 @@ static void handle_search(unsigned id, const char *query_str, int limit) {
     }
 
     FsearchDatabaseSearchView *view =
-        fsearch_database_index_store_get_search_view(g_store, view_id);
+        fsearch_database_index_store_get_search_view(store, view_id);
     if (!view) {
         fsearch_query_unref(query);
+        fsearch_database_index_store_unref(store);
         send_error(id, -32005, "No search view");
         return;
     }
@@ -197,44 +262,34 @@ static void handle_search(unsigned id, const char *query_str, int limit) {
     jb_free(&jb);
     if (info) fsearch_database_search_info_unref(info);
     fsearch_query_unref(query);
+    fsearch_database_index_store_unref(store);
 }
 
 /* ────────────── scan / save / load / status ────────────── */
 
 static void handle_scan(unsigned id, const char *path) {
-    if (path && *path) {
-        g_free(g_index_dir);
-        g_index_dir = g_strdup(path);
+    if (!path || !*path) {
+        path = g_index_dir ? g_index_dir : ".";
     }
-    if (!g_index_dir) g_index_dir = g_strdup(".");
+    g_free(g_index_dir);
+    g_index_dir = g_strdup(path);
 
-    /* Create include manager and add the directory */
-    FsearchDatabaseIncludeManager *im = fsearch_database_include_manager_new();
-    FsearchDatabaseInclude *inc = fsearch_database_include_new(g_index_dir, TRUE, FALSE, TRUE, TRUE, 0, 0);
-    if (!inc) {
-        send_error(id, -32010, "Failed to create include entry");
+    pthread_mutex_lock(&g_store_lock);
+    if (g_scanning) {
+        pthread_mutex_unlock(&g_store_lock);
+        send_error(id, -32013, "Scan already in progress");
         return;
     }
-    fsearch_database_include_manager_add(im, inc);
-    fsearch_database_include_unref(inc);
+    g_scanning = 1;
+    pthread_mutex_unlock(&g_store_lock);
 
-    /* Create exclude manager (empty — no exclusions) */
-    FsearchDatabaseExcludeManager *em = fsearch_database_exclude_manager_new();
+    /* Spawn background scan thread */
+    ScanArg *sa = calloc(1, sizeof(ScanArg));
+    sa->path = g_strdup(g_index_dir);
 
-    FsearchDatabaseIndexPropertyFlags flags =
-        DATABASE_INDEX_PROPERTY_NAME |
-        DATABASE_INDEX_PROPERTY_PATH |
-        DATABASE_INDEX_PROPERTY_MODIFICATION_TIME;
-
-    /* Create the index store — this triggers the scan */
-    g_store = fsearch_database_index_store_new(im, em, flags, NULL, NULL);
-    if (!g_store) {
-        send_error(id, -32010, "Failed to create index store");
-        return;
-    }
-
-    /* Start scanning */
-    fsearch_database_index_store_start(g_store, NULL);
+    pthread_t thr;
+    pthread_create(&thr, NULL, scan_thread, sa);
+    pthread_detach(thr);
 
     JsonBuilder jb;
     jb_init(&jb);
@@ -246,12 +301,14 @@ static void handle_scan(unsigned id, const char *path) {
 }
 
 static void handle_save(unsigned id, const char *path) {
-    if (!g_store) {
+    FsearchDatabaseIndexStore *store = get_store();
+    if (!store) {
         send_error(id, -32000, "No database to save");
         return;
     }
     const char *save_path = path ? path : (g_db_path ? g_db_path : "fsearch-index.db");
-    gboolean ok = fsearch_database_file_save(g_store, save_path);
+    gboolean ok = fsearch_database_file_save(store, save_path);
+    fsearch_database_index_store_unref(store);
     if (!ok) {
         send_error(id, -32011, "Failed to save database");
         return;
@@ -268,40 +325,47 @@ static void handle_save(unsigned id, const char *path) {
 static void handle_load(unsigned id, const char *path) {
     const char *load_path = path ? path : (g_db_path ? g_db_path : "fsearch-index.db");
 
+    FsearchDatabaseIndexStore *store = NULL;
     gboolean ok = fsearch_database_file_load(
-        load_path, NULL, &g_store, NULL, NULL);
-    if (!ok || !g_store) {
+        load_path, NULL, &store, NULL, NULL);
+    if (!ok || !store) {
         send_error(id, -32012, "Failed to load database");
         return;
     }
+    set_store(store);
+    fsearch_database_index_store_unref(store);
 
+    store = get_store();
     JsonBuilder jb;
     jb_init(&jb);
     jb_puts(&jb, "{\"status\":\"loaded\",\"path\":");
     jb_json_str(&jb, load_path);
     jb_puts(&jb, ",\"files\":");
     char fc[32]; snprintf(fc, sizeof fc, "%u",
-        fsearch_database_index_store_get_num_files(g_store));
+        store ? fsearch_database_index_store_get_num_files(store) : 0);
     jb_puts(&jb, fc);
     jb_puts(&jb, ",\"folders\":");
     char foc[32]; snprintf(foc, sizeof foc, "%u",
-        fsearch_database_index_store_get_num_folders(g_store));
+        store ? fsearch_database_index_store_get_num_folders(store) : 0);
     jb_puts(&jb, foc);
     jb_puts(&jb, "}");
     send_result(id, jb.buf);
     jb_free(&jb);
+    if (store) fsearch_database_index_store_unref(store);
 }
 
 static void handle_status(unsigned id) {
-    if (!g_store) {
+    FsearchDatabaseIndexStore *store = get_store();
+    if (!store) {
         send_result(id, "{\"initialized\":false,\"files\":0,\"folders\":0}");
         return;
     }
     char buf[256];
     snprintf(buf, sizeof buf,
         "{\"initialized\":true,\"files\":%u,\"folders\":%u}",
-        fsearch_database_index_store_get_num_files(g_store),
-        fsearch_database_index_store_get_num_folders(g_store));
+        fsearch_database_index_store_get_num_files(store),
+        fsearch_database_index_store_get_num_folders(store));
+    fsearch_database_index_store_unref(store);
     send_result(id, buf);
 }
 
