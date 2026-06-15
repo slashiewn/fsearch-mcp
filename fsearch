@@ -1,0 +1,207 @@
+#!/usr/bin/env python3
+"""fsearch — CLI wrapper for fsearch-mcp daemon.
+
+Usage:
+  fsearch scan <path>          # Index a directory (prints progress live)
+  fsearch <query>              # Search indexed files
+  fsearch status               # Show index status
+
+Examples:
+  fsearch scan /mnt/SSD/git/obs
+  fsearch 评注
+  fsearch "*.c" --limit 10
+"""
+
+import sys
+import json
+import subprocess
+import threading
+import os
+import time
+import signal
+
+DAEMON = os.path.join(os.path.dirname(__file__), 'fsearch-mcp')
+INDEX_DIR = os.path.expanduser('~/.cache/fsearch-mcp')
+INDEX_DB = os.path.join(INDEX_DIR, 'index.db')
+
+# Ensure index directory exists
+os.makedirs(INDEX_DIR, exist_ok=True)
+
+def fmt_path(p, maxw=100):
+    """Shorten long paths for display"""
+    if len(p) > maxw:
+        return '…' + p[-(maxw-1):]
+    return p
+
+class FsearchClient:
+    def __init__(self, verbose=False):
+        self.proc = subprocess.Popen(
+            [DAEMON, '--db', INDEX_DB, '--verbose'] if verbose else [DAEMON, '--db', INDEX_DB],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            bufsize=0
+        )
+        self.pending = {}
+        self.next_id = 1
+        self.reader = threading.Thread(target=self._reader, daemon=True)
+        self.reader.start()
+        # Wait for server init
+        time.sleep(0.3)
+
+    def _reader(self):
+        buf = b''
+        while True:
+            # Read content-length header
+            header_end = buf.find(b'\r\n\r\n')
+            while header_end < 0:
+                c = self.proc.stdout.read(1)
+                if not c: return
+                buf += c
+                header_end = buf.find(b'\r\n\r\n')
+
+            hdr = buf[:header_end].decode(errors='replace')
+            cl = 0
+            for line in hdr.split('\r\n'):
+                if line.lower().startswith('content-length:'):
+                    cl = int(line.split(':')[1].strip())
+                    break
+
+            body_start = header_end + 4
+            while len(buf) < body_start + cl:
+                c = self.proc.stdout.read(1)
+                if not c: return
+                buf += c
+
+            body = buf[body_start:body_start+cl]
+            buf = buf[body_start+cl:]
+
+            try:
+                msg = json.loads(body)
+                mid = msg.get('id')
+                if mid is not None and mid in self.pending:
+                    self.pending[mid] = msg
+                elif msg.get('method') == 'notifications/progress':
+                    params = msg.get('params', {})
+                    files = params.get('files', 0)
+                    print(f"\r\033[K📁 已扫描 {files} 个文件...", end='', flush=True, file=sys.stderr)
+            except:
+                pass
+
+    def call(self, tool, args=None, timeout=60):
+        mid = self.next_id
+        self.next_id += 1
+        req = {"jsonrpc":"2.0","id":mid,"method":"tools/call",
+               "params":{"name":tool, "arguments": args or {}}}
+        data = json.dumps(req).encode()
+        self.pending[mid] = None
+        self.proc.stdin.write(f'Content-Length: {len(data)}\r\n\r\n'.encode())
+        self.proc.stdin.write(data)
+        self.proc.stdin.flush()
+
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self.pending.get(mid) is not None:
+                return self.pending.pop(mid)
+            time.sleep(0.1)
+        return {"error": {"code": -32000, "message": "timeout"}}
+
+    def close(self):
+        self.proc.terminate()
+        self.proc.wait()
+
+def cmd_scan(path):
+    """Scan a directory and show progress"""
+    path = os.path.abspath(path)
+    print(f"📡 扫描: {path}", file=sys.stderr)
+    client = FsearchClient(verbose=True)
+    result = client.call('scan', {'path': path})
+    if 'error' in result:
+        print(f"\n❌ 扫描失败: {result['error']}", file=sys.stderr)
+        client.close()
+        return 1
+
+    # Wait for scan to complete by polling status
+    last_files = 0
+    for _ in range(120):  # up to 2 min
+        time.sleep(1)
+        status = client.call('status')
+        r = status.get('result', {})
+        if r.get('initialized') and r.get('files', 0) > 0:
+            files = r['files']
+            folders = r.get('folders', 0)
+            print(f"\r\033[K✅ 扫描完成: {files} 文件, {folders} 目录", file=sys.stderr)
+            break
+        files = r.get('files', 0)
+        if files != last_files:
+            print(f"\r\033[K📁 已索引 {files} 个文件...", end='', flush=True, file=sys.stderr)
+            last_files = files
+    else:
+        print(f"\r\033[K⚠️ 扫描可能仍在后台运行", file=sys.stderr)
+
+    # Save index
+    client.call('save')
+    client.close()
+    return 0
+
+def cmd_search(query, limit=30):
+    """Search indexed files"""
+    client = FsearchClient()
+    result = client.call('search', {'query': query, 'limit': limit})
+    client.close()
+
+    if 'error' in result:
+        print(f"❌ 搜索失败: {result['error']}")
+        # Auto-scan if no index
+        if result['error'].get('code') == -32000:
+            print("💡 请先运行: fsearch scan <目录>")
+        return 1
+
+    r = result.get('result', {})
+    total = r.get('total', 0)
+    matches = r.get('matches', [])
+
+    print(f"🔍 搜索 \"{query}\" → 命中 {total} 个文件")
+    if matches:
+        print("─" * 60)
+        for m in matches:
+            print(f"  {m}")
+    return 0
+
+def cmd_status():
+    """Show index status"""
+    client = FsearchClient()
+    result = client.call('status')
+    client.close()
+    r = result.get('result', {})
+    if r.get('initialized'):
+        print(f"📊 索引状态")
+        print(f"   文件: {r.get('files', 0)}")
+        print(f"   目录: {r.get('folders', 0)}")
+    else:
+        print("📊 索引为空 (运行 fsearch scan <目录>)")
+    return 0
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ('-h', '--help'):
+        print(__doc__)
+        return 0
+
+    cmd = sys.argv[1]
+    if cmd == 'scan':
+        path = sys.argv[2] if len(sys.argv) > 2 else os.getcwd()
+        return cmd_scan(path)
+    elif cmd == 'status':
+        return cmd_status()
+    elif cmd in ('search', 'find'):
+        query = sys.argv[2] if len(sys.argv) > 2 else ''
+        limit = 30
+        if '--limit' in sys.argv:
+            idx = sys.argv.index('--limit')
+            if idx + 1 < len(sys.argv):
+                limit = int(sys.argv[idx + 1])
+        return cmd_search(query, limit)
+    else:
+        # If not a known command, treat as search query
+        return cmd_search(' '.join(sys.argv[1:]))
+
+if __name__ == '__main__':
+    sys.exit(main())

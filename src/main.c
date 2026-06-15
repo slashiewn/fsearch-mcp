@@ -86,9 +86,32 @@ static void send_result(unsigned id, const char *result_json) {
 }
 
 static void send_error(unsigned id, int code, const char *msg_text) {
-    char *msg = g_strdup_printf(
-        "{\"jsonrpc\":\"2.0\",\"id\":%u,\"error\":{\"code\":%d,\"message\":%s}}",
-        id, code, msg_text ? "\"error\"" : "null");
+    /* Quick inline JSON string escaping for error messages */
+    const char *safe = msg_text ? msg_text : "unknown error";
+    /* Count length needed */
+    size_t slen = 0;
+    const char *p = safe;
+    while (*p) {
+        if (*p == '"' || *p == '\\' || *p < 0x20) slen += 4;
+        else slen++;
+        p++;
+    }
+    /* Build the JSON string manually to avoid another g_strdup_printf layer */
+    size_t mlen = slen + 2; /* quotes + content */
+    char *msg = g_malloc(256 + mlen);
+    int n = snprintf(msg, 256 + mlen,
+        "{\"jsonrpc\":\"2.0\",\"id\":%u,\"error\":{\"code\":%d,\"message\":\"",
+        id, code);
+    p = safe;
+    while (*p) {
+        unsigned char c = *p++;
+        if (c == '"') { msg[n++] = '\\'; msg[n++] = '"'; }
+        else if (c == '\\') { msg[n++] = '\\'; msg[n++] = '\\'; }
+        else if (c < 0x20) { n += snprintf(msg+n, 6, "\\u%04x", c); }
+        else msg[n++] = c;
+    }
+    n += snprintf(msg+n, 48, "\"}}");
+    msg[n] = '\0';
     send_jsonrpc(id, msg);
     g_free(msg);
 }
@@ -126,6 +149,66 @@ static char *g_db_path = NULL;
 static char *g_index_dir = NULL;
 static pthread_mutex_t g_store_lock = PTHREAD_MUTEX_INITIALIZER;
 static volatile int g_scanning = 0;
+static volatile int g_verbose = 0;
+static volatile uint32_t g_scan_files = 0;
+static pthread_mutex_t g_stdout_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Thread-safe stdout write */
+static void safe_write(const char *hdr, size_t hlen, const char *body, size_t blen) {
+    pthread_mutex_lock(&g_stdout_lock);
+    fwrite(hdr, 1, hlen, stdout);
+    fwrite(body, 1, blen, stdout);
+    fflush(stdout);
+    pthread_mutex_unlock(&g_stdout_lock);
+}
+
+/* Store event callback — receives progress from FSearch engine during scan */
+static void
+store_event_cb(FsearchDatabaseIndexStore *store,
+               FsearchDatabaseIndexStoreEventKind kind,
+               gpointer data,
+               gpointer user_data)
+{
+    (void)store;
+    (void)user_data;
+    char *path = (char *)data;
+
+    if (kind == FSEARCH_DATABASE_INDEX_STORE_EVENT_PROGRESS) {
+        g_scan_files++;
+        if (g_verbose) {
+            fprintf(stderr, "\r\033[K📁 已扫描 %u 个文件...  %s", g_scan_files, path ? path : "");
+            fflush(stderr);
+        }
+        /* Send MCP notification on stdout (message framing only) */
+        char *notif = g_strdup_printf(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{"
+            "\"files\":%u}}",
+            g_scan_files);
+        size_t nlen = strlen(notif);
+        char header[64];
+        int hn = snprintf(header, sizeof header, "Content-Length: %zu\r\n\r\n", nlen);
+        safe_write(header, hn, notif, nlen);
+        g_free(notif);
+
+    } else if (kind == FSEARCH_DATABASE_INDEX_STORE_EVENT_CONTENT_CHANGED) {
+        uint32_t nf = fsearch_database_index_store_get_num_files(store);
+        uint32_t nd = fsearch_database_index_store_get_num_folders(store);
+        if (g_verbose) {
+            fprintf(stderr, "\r\033[K✅ 扫描完成: %u 文件, %u 目录\n", nf, nd);
+            fflush(stderr);
+        }
+        /* Final progress notification */
+        char *fin = g_strdup_printf(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\",\"params\":{"
+            "\"files\":%u,\"folders\":%u,\"done\":true}}", nf, nd);
+        size_t flen = strlen(fin);
+        char fheader[64];
+        int fhn = snprintf(fheader, sizeof fheader, "Content-Length: %zu\r\n\r\n", flen);
+        safe_write(fheader, fhn, fin, flen);
+        g_free(fin);
+    }
+    g_free(data);
+}
 
 /* Background scan thread */
 typedef struct {
@@ -149,7 +232,9 @@ static void* scan_thread(void *arg) {
         DATABASE_INDEX_PROPERTY_PATH |
         DATABASE_INDEX_PROPERTY_MODIFICATION_TIME;
 
-    FsearchDatabaseIndexStore *store = fsearch_database_index_store_new(im, em, flags, NULL, NULL);
+    g_scan_files = 0;
+
+    FsearchDatabaseIndexStore *store = fsearch_database_index_store_new(im, em, flags, store_event_cb, NULL);
     if (store) {
         fsearch_database_index_store_start(store, NULL);
 
@@ -516,12 +601,15 @@ int main(int argc, char *argv[]) {
     const char *index_dir = NULL;
 
     for (int i = 1; i < argc; i++) {
-        if (g_str_equal(argv[i], "--db") && i+1 < argc)    db_path = argv[++i];
+        if (g_str_equal(argv[i], "--db") && i+1 < argc)       db_path = argv[++i];
         else if (g_str_equal(argv[i], "--dir") && i+1 < argc) index_dir = argv[++i];
+        else if (g_str_equal(argv[i], "-v") || g_str_equal(argv[i], "--verbose")) g_verbose = 1;
         else if (g_str_equal(argv[i], "--help")) {
-            printf("fsearch-mcp [--db <path>] [--dir <path>]\n"
-                   "  --db     path to persistent index database\n"
-                   "  --dir    directory to scan\n");
+            printf("fsearch-mcp [options]\n"
+                   "  --db <path>   persistent index database path\n"
+                   "  --dir <path>  directory to scan\n"
+                   "  -v, --verbose show scan progress on stderr\n"
+                   "  --help        this message\n");
             return 0;
         }
     }
